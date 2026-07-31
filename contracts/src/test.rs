@@ -1,6 +1,7 @@
 #![cfg(test)]
-extern crate std;
+extern crate std
 use super::*;
+use crate::errors::ContractError;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
     token, Env, IntoVal, Map, String, Symbol, Vec, symbol_short,
@@ -38,6 +39,70 @@ fn make_metadata(env: &Env) -> Map<String, String> {
 // ---------------------------------------------------------------------------
 // Existing stream-lifecycle tests (metadata = None)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn test_claim_transfers_tokens_and_updates_balance() {
+    let env = Env::default();
+    env.mock_all_signatures();
+
+    // Register escrow contract
+    let contract_id = env.register_contract(None, EscrowVestingContract);
+    let client = EscrowVestingContractClient::new(&env, &contract_id);
+
+    // Setup mock admin, recipient, and SAC token
+    let admin = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract(token_admin.clone());
+    let token_client = token::Client::new(&env, &token_contract);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_contract);
+
+    // Mint tokens to escrow contract (simulate initial funding)
+    let vesting_amount: i128 = 10_000_000; // 10 XLM in stroops / base units
+    token_admin_client.mint(&contract_id, &vesting_amount);
+
+    // Verify initial balances
+    assert_eq!(token_client.balance(&contract_id), vesting_amount);
+    assert_eq!(token_client.balance(&recipient), 0);
+
+    // Setup contract storage state
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&Symbol::new(&env, "total_vested"), &vesting_amount);
+        env.storage().instance().set(&Symbol::new(&env, "claimed_amount"), &0i128);
+    });
+
+    // Execute claim
+    let claimed = client.claim(&recipient, &token_contract);
+
+    // Assertions
+    assert_eq!(claimed, vesting_amount);
+    assert_eq!(token_client.balance(&recipient), vesting_amount);
+    assert_eq!(token_client.balance(&contract_id), 0);
+}
+
+#[test]
+fn test_over_claim_reverts_with_insufficient_vested() {
+    let env = Env::default();
+    env.mock_all_signatures();
+
+    let contract_id = env.register_contract(None, EscrowVestingContract);
+    let client = EscrowVestingContractClient::new(&env, &contract_id);
+
+    let recipient = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_contract = env.register_stellar_asset_contract(token_admin);
+
+    // Set storage where everything has already been claimed
+    env.as_contract(&contract_id, || {
+        env.storage().instance().set(&Symbol::new(&env, "total_vested"), &1000i128);
+        env.storage().instance().set(&Symbol::new(&env, "claimed_amount"), &1000i128);
+    });
+
+    // Attempting to claim again should revert with InsufficientVested
+    let res = client.try_claim(&recipient, &token_contract);
+    assert_eq!(res, Err(Ok(ContractError::InsufficientVested)));
+}
 
 #[test]
 fn test_get_next_stream_id() {
@@ -189,8 +254,13 @@ fn test_claim_after_stream_fully_completed() {
 }
 
 #[test]
-#[should_panic(expected = "amount exceeds claimable")]
 fn test_claim_on_canceled_stream() {
+    // Issue #591: After cancel, the contract atomically finalizes the stream
+    // (recipient gets the unclaimed vested remainder, sender gets the
+    // unvested refund). Therefore:
+    //   * `claimable` returns 0
+    //   * A subsequent `claim` call panics with "amount exceeds claimable"
+    //     because the contract no longer owes anything to the recipient.
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, StellarStreamContract);
@@ -201,33 +271,35 @@ fn test_claim_on_canceled_stream() {
     let token = create_token(&env, &admin);
     let token_admin = token::StellarAssetClient::new(&env, &token);
     token_admin.mint(&sender, &1000);
-    
-    // Create stream from time 0 to 1000
+
+    // Create stream from time 0 to 1000.
     let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
-    
-    // Move to midpoint (500 vested)
+
+    // Move to midpoint (500 vested).
     env.ledger().with_mut(|l| l.timestamp = 500);
-    
-    // Cancel the stream at midpoint
+
+    // Cancel the stream at midpoint.
     client.cancel(&stream_id, &sender);
-    
-    // Verify stream is canceled and end_time is adjusted
+
+    // Verify stream is canceled and bounded to the cancel moment.
     let stream = client.get_stream(&stream_id);
     assert!(stream.canceled);
     assert_eq!(stream.end_time, 500);
-    assert_eq!(stream.total_amount, 500); // Only 500 vested at cancel time
-    
-    // Recipient can claim the vested amount (500)
-    let claimed = client.claim(&stream_id, &recipient, &500);
-    assert_eq!(claimed, 500);
-    
-    // Move time forward
-    env.ledger().with_mut(|l| l.timestamp = 800);
-    
-    // Attempting to claim more should panic because nothing more is claimable
-    // (stream was canceled at 500, so only 500 total was vested)
-    client.claim(&stream_id, &recipient, &100);
+    assert_eq!(stream.total_amount, 500); // bounded to vested-at-cancel
+
+    // Recipient's vested 500 was transferred atomically during cancel.
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&recipient), 500);
+    assert_eq!(token_client.balance(&sender), 500); // unvested refund
+
+    // claimable is now 0 — the post-cancel invariant (#591).
+    assert_eq!(client.claimable(&stream_id, &500), 0);
+    assert_eq!(client.claimable(&stream_id, &800), 0);
+    assert_eq!(client.claimable(&stream_id, &9999), 0);
 }
+
+// Panic-path companion tests live in the dedicated "Issue #591" section
+// further down.
 
 #[test]
 #[should_panic(expected = "insufficient sender balance")]
@@ -371,6 +443,9 @@ fn test_cancel_idempotent_double_cancel_does_not_panic() {
 
 #[test]
 fn test_cancel_recipient_cannot_claim_beyond_vested_at_cancel_time() {
+    // After `cancel`, the vested portion is paid out to the recipient
+    // atomically inside `cancel()`. Nothing more can be claimed via the
+    // contract — a subsequent `claim` would panic because `claimable == 0`.
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, StellarStreamContract);
@@ -384,13 +459,17 @@ fn test_cancel_recipient_cannot_claim_beyond_vested_at_cancel_time() {
     let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
     env.ledger().with_mut(|l| l.timestamp = 500);
     client.cancel(&stream_id, &sender);
-    client.claim(&stream_id, &recipient, &500);
     let token_client = token::Client::new(&env, &token);
+    // Recipient auto-receives the 500 vested at cancel time.
     assert_eq!(token_client.balance(&recipient), 500);
+    assert_eq!(client.claimable(&stream_id, &1000), 0);
 }
 
 #[test]
 fn test_cancel_after_partial_claim_refunds_correct_amount_and_preserves_token_conservation() {
+    // After `cancel`, the unclaimed vested remainder (700 - 300 = 400) is
+    // transferred to the recipient atomically, so the recipient's final
+    // balance is 300 (claimed earlier) + 400 (auto-paid on cancel) = 700.
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, StellarStreamContract);
@@ -410,12 +489,13 @@ fn test_cancel_after_partial_claim_refunds_correct_amount_and_preserves_token_co
 
     let token_client = token::Client::new(&env, &token);
     assert_eq!(token_client.balance(&sender), 300);
-    assert_eq!(token_client.balance(&recipient), 300);
-    assert_eq!(client.claimable(&stream_id, &9999), 400);
+    assert_eq!(token_client.balance(&recipient), 700);
+    assert_eq!(client.claimable(&stream_id, &9999), 0);
 
     let stream = client.get_stream(&stream_id);
     assert_snapshot!("stream_cancel_after_partial_claim", stream);
-    assert_eq!(300 + 300 + 400, 1000);
+    // 300 (sender refund) + 700 (recipient total) + 0 (remaining claimable) = 1000
+    assert_eq!(300 + 700 + 0, 1000);
 }
 
 #[test]
@@ -687,6 +767,9 @@ fn test_create_split_stream_creates_child_streams_and_links() {
 
 #[test]
 fn test_split_stream_claim_and_cancel_work_per_substream() {
+    // For child_b (600 over 1000s) canceled at t=500: vested = 300. The
+    // contract auto-transfers the 300 to recipient_b, refunds the 300 to
+    // the sender, and then `claimable` for child_b is 0.
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, StellarStreamContract);
@@ -715,8 +798,9 @@ fn test_split_stream_claim_and_cancel_work_per_substream() {
     client.cancel(&child_b_id, &sender);
 
     assert_eq!(token_client.balance(&recipient_a), 200);
+    assert_eq!(token_client.balance(&recipient_b), 300);
     assert_eq!(token_client.balance(&sender), 300);
-    assert_eq!(client.claimable(&child_b_id, &1000), 300);
+    assert_eq!(client.claimable(&child_b_id, &1000), 0);
 }
 
 #[test]
@@ -862,6 +946,85 @@ fn test_claimable_after_end_time() {
     token_admin.mint(&sender, &1000);
     let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &1000, &2000, &0, &None);
     assert_eq!(client.claimable(&stream_id, &2100), 1000);
+}
+
+// -----------------------------------------------------------------
+// Issue #591 — Post-cancel claimable must return 0
+// -----------------------------------------------------------------
+
+/// After `cancel`, `claimable(stream_id, at_time)` must return `0` regardless
+/// of the `at_time` argument (including values well past the original end
+/// and beyond the cancel moment). This is the acceptance criterion for
+/// issue #591.
+#[test]
+fn test_claimable_returns_zero_after_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+
+    // Mid-stream cancel where 50% (500) is vested at the moment of cancel.
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.cancel(&stream_id, &sender);
+
+    // Post-cancel queries across a wide range of `at_time` values all return 0.
+    assert_eq!(client.claimable(&stream_id, &0), 0);
+    assert_eq!(client.claimable(&stream_id, &500), 0);
+    assert_eq!(client.claimable(&stream_id, &999), 0);
+    assert_eq!(client.claimable(&stream_id, &1000), 0);
+    assert_eq!(client.claimable(&stream_id, &9_999_999), 0);
+
+    // And no funds are stuck: recipient has the 500 vested at cancel time,
+    // sender has the 500 unvested refund. (We check these BEFORE creating
+    // the second stream below, which would draw from the sender's refund.)
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&recipient), 500);
+    assert_eq!(token_client.balance(&sender), 500);
+
+    // The batch endpoint reports 0 for the canceled stream id as well —
+    // mixed in with a still-active stream to confirm we don't accidentally
+    // zero out unrelated entries.
+    let other_stream_id = client.create_stream(&sender, &recipient, &token, &200, &1000, &2000, &0, &None);
+    let mut ids = Vec::new(&env);
+    ids.push_back(stream_id);
+    ids.push_back(other_stream_id);
+    let batch = client.get_claimable_batch(&ids, &1500);
+    assert_eq!(batch.get(stream_id).unwrap(), 0);
+    assert_eq!(batch.get(other_stream_id).unwrap(), 100);
+}
+
+/// A subsequent `claim` after `cancel` must panic because nothing is left
+/// to claim — locks down the post-cancel invariant from the user side.
+#[test]
+#[should_panic(expected = "amount exceeds claimable")]
+fn test_claim_after_cancel_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.cancel(&stream_id, &sender);
+
+    env.ledger().with_mut(|l| l.timestamp = 900);
+    client.claim(&stream_id, &recipient, &1);
 }
 
 // -----------------------------------------------------------------
@@ -1318,6 +1481,9 @@ fn test_clawback_emits_event() {
 
 #[test]
 fn test_clawback_after_canceled_stream_transfers_to_admin() {
+    // After `cancel` settles the stream (vested-out to recipient + refund to
+    // sender), there is nothing left to claw back. The clawback call degrades
+    // to a no-op and `claimable` stays at 0.
     let env = Env::default();
     env.mock_all_auths();
     let contract_id = env.register_contract(None, StellarStreamContract);
@@ -1339,13 +1505,18 @@ fn test_clawback_after_canceled_stream_transfers_to_admin() {
     env.ledger().with_mut(|l| l.timestamp = 400);
     client.cancel(&stream_id, &sender);
 
+    // After cancel: recipient received the 400 vested, sender refunded 600.
+    let token_client = token::Client::new(&env, &token);
+    assert_eq!(token_client.balance(&recipient), 400);
+    assert_eq!(token_client.balance(&sender), 600);
+
     env.ledger().with_mut(|l| l.timestamp = 500);
     let clawed = client.clawback(&stream_id, &200, &compliance_admin);
 
-    assert_eq!(clawed, 200);
-    let token_client = token::Client::new(&env, &token);
-    assert_eq!(token_client.balance(&compliance_admin), 200);
-    assert_eq!(client.claimable(&stream_id, &500), 200);
+    // Nothing to claw because the recipient already collected the vested 400.
+    assert_eq!(clawed, 0);
+    assert_eq!(token_client.balance(&compliance_admin), 0);
+    assert_eq!(client.claimable(&stream_id, &500), 0);
 }
 
 /// Token conservation: recipient claims + admin clawback = total vested at clawback time.
@@ -2331,4 +2502,670 @@ fn test_cancel_after_partial_claim_full_lifecycle() {
     // Step 7: Token conservation: sender_refund + claimed == total original amount
     let recipient_balance = token_client.balance(&recipient);
     assert_eq!(sender_refund + recipient_balance, 100);
+}
+
+// =============================================================================
+// #593 — Multi-token allowlist management tests
+// =============================================================================
+
+/// After initialize with an allowlist, get_allowed_tokens returns those tokens.
+#[test]
+fn test_get_allowed_tokens_returns_initialized_list() {
+// #594 — Comprehensive stream state transitions & edge-case coverage
+// =============================================================================
+
+/// Full lifecycle: create → claim partial → advance to completion → claim remainder
+#[test]
+fn test_full_lifecycle_create_claim_complete() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let allowed = soroban_sdk::vec![&env, token_a.clone(), token_b.clone()];
+    client.initialize(&admin, &Address::generate(&env), &allowed);
+
+    let result = client.get_allowed_tokens();
+    assert_eq!(result.len(), 2);
+    assert!(result.contains(&token_a));
+    assert!(result.contains(&token_b));
+}
+
+/// get_allowed_tokens returns empty Vec before initialize is called.
+#[test]
+fn test_get_allowed_tokens_returns_empty_before_init() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let result = client.get_allowed_tokens();
+    assert_eq!(result.len(), 0);
+}
+
+/// add_allowed_token appends a new token to the allowlist.
+#[test]
+fn test_add_allowed_token_appends_to_list() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+    let token_client = token::Client::new(&env, &token);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    assert_eq!(client.get_stream_count(), 1);
+
+    env.ledger().with_mut(|l| l.timestamp = 400);
+    let claimed = client.claim(&stream_id, &recipient, &400);
+    assert_eq!(claimed, 400);
+    assert_eq!(token_client.balance(&recipient), 400);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    let claimed = client.claim(&stream_id, &recipient, &600);
+    assert_eq!(claimed, 600);
+    assert_eq!(token_client.balance(&recipient), 1000);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.claimed_amount, 1000);
+    assert_eq!(stream.total_amount, 1000);
+
+    assert_eq!(client.claimable(&stream_id, &1000), 0);
+    assert_eq!(client.claimable(&stream_id, &2000), 0);
+}
+
+/// Full lifecycle: create → wait for partial vesting → cancel → verify refund and final state
+#[test]
+fn test_full_lifecycle_create_cancel() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    assert_eq!(client.get_allowed_tokens().len(), 0);
+
+    let token_a = Address::generate(&env);
+    client.add_allowed_token(&admin, &token_a);
+
+    let result = client.get_allowed_tokens();
+    assert_eq!(result.len(), 1);
+    assert!(result.contains(&token_a));
+}
+
+/// add_allowed_token is idempotent: adding the same token twice keeps only one entry.
+#[test]
+fn test_add_allowed_token_idempotent() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, token_a.clone()]);
+
+    // Add the same token again
+    client.add_allowed_token(&admin, &token_a);
+
+    assert_eq!(client.get_allowed_tokens().len(), 1);
+}
+
+/// Non-admin cannot add a token; panics with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_add_allowed_token_non_admin_panics() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+    let token_client = token::Client::new(&env, &token);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 600);
+    client.cancel(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert!(stream.canceled);
+    assert_eq!(stream.total_amount, 600);
+    assert_eq!(stream.end_time, 600);
+
+    assert_eq!(token_client.balance(&sender), 400);
+
+    let claimed = client.claim(&stream_id, &recipient, &600);
+    assert_eq!(claimed, 600);
+    assert_eq!(token_client.balance(&recipient), 600);
+
+    assert_eq!(client.claimable(&stream_id, &2000), 0);
+    assert_eq!(token_client.balance(&sender) + token_client.balance(&recipient), 1000);
+}
+
+/// Full lifecycle: create → pause → resume → claim → complete
+#[test]
+fn test_full_lifecycle_pause_resume_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+j    let attacker = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    client.add_allowed_token(&attacker, &Address::generate(&env));
+}
+
+/// remove_allowed_token removes an existing token from the allowlist.
+#[test]
+fn test_remove_allowed_token_removes_from_list() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    client.initialize(
+        &admin,
+        &Address::generate(&env),
+        &soroban_sdk::vec![&env, token_a.clone(), token_b.clone()],
+    );
+
+    client.remove_allowed_token(&admin, &token_a);
+
+    let result = client.get_allowed_tokens();
+    assert_eq!(result.len(), 1);
+    assert!(!result.contains(&token_a));
+    assert!(result.contains(&token_b));
+}
+
+/// remove_allowed_token on a token not in the list is a no-op (no panic).
+#[test]
+fn test_remove_allowed_token_missing_is_noop() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+    let token_client = token::Client::new(&env, &token);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 300);
+    client.pause_stream(&stream_id, &sender);
+
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    assert_eq!(client.claimable(&stream_id, &500), 300);
+
+    client.resume_stream(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.start_time, 200);
+    assert_eq!(stream.end_time, 1200);
+
+    env.ledger().with_mut(|l| l.timestamp = 700);
+    let claimed = client.claim(&stream_id, &recipient, &500);
+    assert_eq!(claimed, 500);
+    assert_eq!(token_client.balance(&recipient), 500);
+
+    env.ledger().with_mut(|l| l.timestamp = 1200);
+    let claimed = client.claim(&stream_id, &recipient, &500);
+    assert_eq!(claimed, 500);
+    assert_eq!(token_client.balance(&recipient), 1000);
+
+    assert_eq!(client.claimable(&stream_id, &2000), 0);
+}
+
+/// Edge case: cancel after full claim — sender_refund should be 0
+#[test]
+fn test_cancel_after_full_claim_zero_refund() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, token_a.clone()]);
+
+    let unknown_token = Address::generate(&env);
+    // Should not panic
+    client.remove_allowed_token(&admin, &unknown_token);
+
+    assert_eq!(client.get_allowed_tokens().len(), 1);
+}
+
+/// Non-admin cannot remove a token; panics with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_remove_allowed_token_non_admin_panics() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+    let token_client = token::Client::new(&env, &token);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+
+    env.ledger().with_mut(|l| l.timestamp = 1000);
+    client.claim(&stream_id, &recipient, &1000);
+    assert_eq!(token_client.balance(&recipient), 1000);
+
+    client.cancel(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert!(stream.canceled);
+    assert_eq!(stream.claimed_amount, 1000);
+
+    assert_eq!(token_client.balance(&sender), 0);
+    assert_eq!(client.claimable(&stream_id, &2000), 0);
+}
+
+/// Edge case: pause with wrong sender panics
+#[test]
+#[should_panic(expected = "sender mismatch")]
+fn test_pause_wrong_sender_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, token_a.clone()]);
+
+    client.remove_allowed_token(&attacker, &token_a);
+}
+
+/// A stream can be created with a token that is on the allowlist.
+#[test]
+fn test_create_stream_with_allowlisted_token_succeeds() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let wrong_sender = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    client.pause_stream(&stream_id, &wrong_sender);
+}
+
+/// Edge case: pause on a canceled stream panics
+#[test]
+#[should_panic(expected = "stream canceled")]
+fn test_pause_canceled_stream_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin_addr = Address::generate(&env);
+    let token = create_token(&env, &token_admin_addr);
+    let token_mint = token::StellarAssetClient::new(&env, &token);
+    token_mint.mint(&sender, &1000);
+
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, token.clone()]);
+
+    // Should succeed — token is on the allowlist
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.token, token);
+}
+
+/// A stream creation is rejected when the token is not on the allowlist.
+#[test]
+#[should_panic(expected = "ContractError::TokenNotAllowed")]
+fn test_create_stream_with_non_allowlisted_token_panics() {
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    client.cancel(&stream_id, &sender);
+    client.pause_stream(&stream_id, &sender);
+}
+
+/// Edge case: resume with wrong sender panics
+#[test]
+#[should_panic(expected = "sender mismatch")]
+fn test_resume_wrong_sender_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin_addr = Address::generate(&env);
+    let allowed_token = create_token(&env, &token_admin_addr);
+    let other_token = create_token(&env, &token_admin_addr);
+
+    let token_mint = token::StellarAssetClient::new(&env, &other_token);
+    token_mint.mint(&sender, &1000);
+
+    // Only allowed_token is on the allowlist; other_token is not
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, allowed_token.clone()]);
+
+    client.create_stream(&sender, &recipient, &other_token, &1000, &0, &1000, &0, &None);
+}
+
+/// After removing a token from the allowlist, creating a stream with it is rejected.
+#[test]
+#[should_panic(expected = "ContractError::TokenNotAllowed")]
+fn test_create_stream_rejected_after_token_removed_from_allowlist() {
+    let wrong_sender = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    env.ledger().with_mut(|l| l.timestamp = 300);
+    client.pause_stream(&stream_id, &sender);
+    client.resume_stream(&stream_id, &wrong_sender);
+}
+
+/// Edge case: clawback with zero amount panics
+#[test]
+#[should_panic(expected = "amount must be positive")]
+fn test_clawback_zero_amount_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin_addr = Address::generate(&env);
+    let token = create_token(&env, &token_admin_addr);
+    let token_mint = token::StellarAssetClient::new(&env, &token);
+    token_mint.mint(&sender, &2000);
+
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env, token.clone()]);
+
+    // First creation succeeds
+    client.create_stream(&sender, &recipient, &token, &100, &0, &1000, &0, &None);
+
+    // Admin removes the token
+    client.remove_allowed_token(&admin, &token);
+
+    // Second creation must now fail
+    client.create_stream(&sender, &recipient, &token, &100, &0, &1000, &0, &None);
+}
+
+/// After adding a token to the allowlist, creating a stream with it succeeds.
+#[test]
+fn test_create_stream_succeeds_after_token_added_to_allowlist() {
+    let token_admin = Address::generate(&env);
+    let compliance_admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &token_admin);
+    let token_mint = token::StellarAssetClient::new(&env, &token);
+    token_mint.mint(&sender, &1000);
+
+    client.initialize(&compliance_admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+    let stream_id = client.create_stream(
+        &sender, &recipient, &token, &1000, &0, &1000, &0, &None,
+    );
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.clawback(&stream_id, &0, &compliance_admin);
+}
+
+/// Edge case: multiple pause/resume cycles
+#[test]
+fn test_multiple_pause_resume_cycles() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token_admin_addr = Address::generate(&env);
+    let token = create_token(&env, &token_admin_addr);
+    let token_mint = token::StellarAssetClient::new(&env, &token);
+    token_mint.mint(&sender, &1000);
+
+    // Initialize with an empty allowlist
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    // Add token to allowlist
+    client.add_allowed_token(&admin, &token);
+
+    // Stream creation should now succeed
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    assert_eq!(client.get_stream(&stream_id).token, token);
+}
+
+// =============================================================================
+// #593 — set_admin tests
+// =============================================================================
+
+/// Admin can transfer the admin role to a new address.
+#[test]
+fn test_set_admin_transfers_admin_role() {
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+
+    // Cycle 1: pause at 200, resume at 300
+    env.ledger().with_mut(|l| l.timestamp = 200);
+    client.pause_stream(&stream_id, &sender);
+    env.ledger().with_mut(|l| l.timestamp = 300);
+    client.resume_stream(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.start_time, 100);
+    assert_eq!(stream.end_time, 1100);
+
+    // Cycle 2: pause at 500, resume at 600
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.pause_stream(&stream_id, &sender);
+    env.ledger().with_mut(|l| l.timestamp = 600);
+    client.resume_stream(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert_eq!(stream.start_time, 200);
+    assert_eq!(stream.end_time, 1200);
+
+    // Verify vesting is correct after two cycles
+    // Total elapsed: (200-0) + (500-300) + ... actually, after resume at 600:
+    // start=200, end=1200.
+    // At t=700, elapsed = 700-200 = 500, total = 1000, vested = 500
+    env.ledger().with_mut(|l| l.timestamp = 700);
+    assert_eq!(client.claimable(&stream_id, &700), 500);
+
+    // At t=1200, fully vested (1200-200 = 1000)
+    env.ledger().with_mut(|l| l.timestamp = 1200);
+    assert_eq!(client.claimable(&stream_id, &1200), 1000);
+}
+
+/// Edge case: over-claim after partial claim should panic
+#[test]
+#[should_panic(expected = "amount exceeds claimable")]
+fn test_over_claim_after_partial_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    client.set_admin(&admin, &new_admin);
+
+    // new_admin can now manage the allowlist without panicking
+    let token_a = Address::generate(&env);
+    client.add_allowed_token(&new_admin, &token_a);
+    assert_eq!(client.get_allowed_tokens().len(), 1);
+}
+
+/// Old admin loses privileges after set_admin is called.
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_admin_old_admin_loses_privileges() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    env.ledger().with_mut(|l| l.timestamp = 300);
+    client.claim(&stream_id, &recipient, &200);
+    // Only 100 is claimable now (300 vested - 200 claimed), trying 101 should panic
+    client.claim(&stream_id, &recipient, &101);
+}
+
+/// Edge case: past start time — stream created with start_time before current ledger time
+/// verifies that claimable is based on elapsed time from start
+#[test]
+fn test_create_with_past_start_time() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    client.set_admin(&admin, &new_admin);
+
+    // Old admin can no longer add tokens
+    client.add_allowed_token(&admin, &Address::generate(&env));
+}
+
+/// Non-admin cannot call set_admin; panics with "unauthorized".
+#[test]
+#[should_panic(expected = "unauthorized")]
+fn test_set_admin_non_admin_panics() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    // Ledger is at 500, but stream started at 0 — past start
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &2000, &0, &None);
+
+    // At ledger time 500, stream has been running for 500 seconds
+    assert_eq!(client.claimable(&stream_id, &500), 250);
+    // At ledger time 1000, 500 vested
+    assert_eq!(client.claimable(&stream_id, &1000), 500);
+
+    // Verify claim works with past start
+    let claimed = client.claim(&stream_id, &recipient, &250);
+    assert_eq!(claimed, 250);
+}
+
+/// Edge case: zero duration in vested_amount (cancel at start_time)
+#[test]
+fn test_zero_duration_after_cancel_at_start() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    client.set_admin(&attacker, &new_admin);
+}
+
+/// Calling set_admin before initialize panics with "contract not initialized".
+#[test]
+#[should_panic(expected = "contract not initialized")]
+fn test_set_admin_before_initialize_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    client.set_admin(&Address::generate(&env), &Address::generate(&env));
+}
+
+/// New admin can also transfer admin to yet another address (chain of transfers).
+#[test]
+fn test_set_admin_chain_transfer() {
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+    let token_client = token::Client::new(&env, &token);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &500, &1500, &0, &None);
+
+    // Cancel exactly at start_time (500)
+    env.ledger().with_mut(|l| l.timestamp = 500);
+    client.cancel(&stream_id, &sender);
+
+    let stream = client.get_stream(&stream_id);
+    assert!(stream.canceled);
+    // Cancel at start_time: min_end = start_time (500), so end_time becomes 500
+    // total_duration = 500 - 500 = 0
+    assert_eq!(stream.end_time, 500);
+    assert_eq!(stream.start_time, 500);
+
+    // With zero duration, vested_amount should return 0
+    assert_eq!(client.claimable(&stream_id, &500), 0);
+    assert_eq!(client.claimable(&stream_id, &2000), 0);
+
+    // Sender gets full refund
+    assert_eq!(token_client.balance(&sender), 1000);
+}
+
+/// Edge case: resume on non-paused stream panics
+#[test]
+#[should_panic(expected = "stream is not paused")]
+fn test_resume_non_paused_stream_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, StellarStreamContract);
+    let client = StellarStreamContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    let admin2 = Address::generate(&env);
+    let admin3 = Address::generate(&env);
+    client.initialize(&admin, &Address::generate(&env), &soroban_sdk::vec![&env]);
+
+    client.set_admin(&admin, &admin2);
+    client.set_admin(&admin2, &admin3);
+
+    // admin3 can add tokens
+    let token_a = Address::generate(&env);
+    client.add_allowed_token(&admin3, &token_a);
+    assert!(client.get_allowed_tokens().contains(&token_a));
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let token = create_token(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&sender, &1000);
+
+    let stream_id = client.create_stream(&sender, &recipient, &token, &1000, &0, &1000, &0, &None);
+    client.resume_stream(&stream_id, &sender);
 }
